@@ -205,12 +205,146 @@ prompt_for_api_key() {
     fi
 }
 
+check_and_install_claude() {
+    print_info ""
+    print_info "=== Claude Desktop Check ==="
+    print_info ""
+    
+    # Check if Claude is installed based on OS
+    local claude_installed=false
+    local claude_path=""
+    
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS
+        if [[ -d "/Applications/Claude.app" ]]; then
+            claude_installed=true
+            claude_path="/Applications/Claude.app"
+        fi
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        # Linux - check for AppImage or snap
+        if command -v claude &> /dev/null; then
+            claude_installed=true
+            claude_path=$(which claude)
+        elif [[ -f "$HOME/.local/bin/claude" ]]; then
+            claude_installed=true
+            claude_path="$HOME/.local/bin/claude"
+        elif snap list claude &> /dev/null 2>&1; then
+            claude_installed=true
+            claude_path="snap"
+        fi
+    elif [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
+        # Windows
+        if [[ -f "$LOCALAPPDATA/Programs/claude/Claude.exe" ]]; then
+            claude_installed=true
+            claude_path="$LOCALAPPDATA/Programs/claude/Claude.exe"
+        fi
+    fi
+    
+    if [[ "$claude_installed" == true ]]; then
+        print_success "Claude Desktop found at: $claude_path"
+        return 0
+    else
+        print_warning "Claude Desktop not found"
+        print_info ""
+        print_info "Would you like to install Claude Desktop?"
+        read -p "Install Claude Desktop? (y/N): " install_claude
+        
+        if [[ "$install_claude" == "y" ]] || [[ "$install_claude" == "Y" ]]; then
+            install_claude_desktop
+        else
+            print_info "Skipping Claude Desktop installation"
+            print_info "You can install it manually from: https://claude.ai/download"
+            return 1
+        fi
+    fi
+}
+
+install_claude_desktop() {
+    print_info "Installing Claude Desktop..."
+    
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS installation
+        print_info "Downloading Claude Desktop for macOS..."
+        curl -L "https://storage.googleapis.com/osprey-downloads-c02f6a0d-347c-492b-a752-3e0651722e97/nest-win-x64/Claude-Setup.dmg" -o /tmp/Claude.dmg
+        print_info "Mounting DMG..."
+        hdiutil attach /tmp/Claude.dmg
+        print_info "Installing Claude.app..."
+        cp -R "/Volumes/Claude/Claude.app" /Applications/
+        hdiutil detach "/Volumes/Claude"
+        rm /tmp/Claude.dmg
+        print_success "Claude Desktop installed to /Applications"
+        
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        # Linux installation - using AppImage
+        print_info "Downloading Claude Desktop AppImage for Linux..."
+        
+        # Create local bin directory if it doesn't exist
+        mkdir -p "$HOME/.local/bin"
+        
+        # Download AppImage (Note: URL may need updating)
+        local download_url="https://storage.googleapis.com/osprey-downloads-c02f6a0d-347c-492b-a752-3e0651722e97/nest-linux-x64/claude-desktop.AppImage"
+        
+        if command -v wget &> /dev/null; then
+            wget -O "$HOME/.local/bin/claude.AppImage" "$download_url"
+        elif command -v curl &> /dev/null; then
+            curl -L "$download_url" -o "$HOME/.local/bin/claude.AppImage"
+        else
+            print_error "Neither wget nor curl found. Please install one of them."
+            return 1
+        fi
+        
+        # Make it executable
+        chmod +x "$HOME/.local/bin/claude.AppImage"
+        
+        # Create desktop entry
+        cat > "$HOME/.local/share/applications/claude.desktop" << 'EOF'
+[Desktop Entry]
+Name=Claude
+Exec=$HOME/.local/bin/claude.AppImage
+Type=Application
+Icon=claude
+Categories=Development;
+EOF
+        
+        print_success "Claude Desktop installed to ~/.local/bin/claude.AppImage"
+        print_info "You may need to add ~/.local/bin to your PATH"
+        
+        # Add to PATH if not already there
+        if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+            export PATH="$HOME/.local/bin:$PATH"
+            print_info "Added ~/.local/bin to PATH"
+        fi
+        
+    elif [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
+        # Windows installation
+        print_info "Downloading Claude Desktop for Windows..."
+        curl -L "https://storage.googleapis.com/osprey-downloads-c02f6a0d-347c-492b-a752-3e0651722e97/nest-win-x64/Claude-Setup.exe" -o /tmp/Claude-Setup.exe
+        print_info "Running installer..."
+        /tmp/Claude-Setup.exe
+        rm /tmp/Claude-Setup.exe
+        print_success "Claude Desktop installer launched"
+    else
+        print_error "Unsupported operating system for automatic installation"
+        print_info "Please download manually from: https://claude.ai/download"
+        return 1
+    fi
+    
+    print_success "Claude Desktop installed successfully!"
+    print_info "Please launch Claude Desktop and sign in with your account"
+}
+
 setup_mcp_config() {
     local script_dir="$1"
     
     print_info ""
     print_info "=== MCP Configuration for Claude ==="
     print_info ""
+    
+    # First check if Claude is installed
+    if ! check_and_install_claude; then
+        print_warning "Continuing without Claude Desktop"
+    fi
     
     # Detect Claude config location
     local config_dir=""
@@ -224,18 +358,20 @@ setup_mcp_config() {
     
     local config_file="$config_dir/claude_desktop_config.json"
     
+    # Create config directory if it doesn't exist
+    if [[ ! -d "$config_dir" ]]; then
+        print_info "Creating Claude config directory..."
+        mkdir -p "$config_dir"
+    fi
+    
     if [[ ! -f "$config_file" ]]; then
-        print_warning "Claude Desktop config not found at: $config_file"
-        print_info "Please ensure Claude Desktop is installed"
-        print_info ""
-        print_info "You'll need to manually add this to your Claude config:"
-        print_info ""
-        cat << EOF
+        print_info "Creating Claude Desktop config..."
+        cat > "$config_file" << EOF
 {
   "mcpServers": {
     "zen-mcp-gpt5": {
       "command": "python",
-      "args": ["$script_dir/server.py"],
+      "args": ["$script_dir/server_gpt5.py"],
       "cwd": "$script_dir",
       "env": {
         "PYTHONPATH": "$script_dir"
@@ -244,10 +380,23 @@ setup_mcp_config() {
   }
 }
 EOF
-        return 1
+        print_success "Created Claude config at: $config_file"
+        print_info "MCP server configured and ready!"
     else
-        print_success "Found Claude Desktop config"
-        print_info "MCP server will be available in Claude after restart"
+        print_success "Found existing Claude Desktop config"
+        print_info ""
+        print_info "To add Zen MCP GPT-5, add this to your config:"
+        print_info ""
+        cat << EOF
+"zen-mcp-gpt5": {
+  "command": "python",
+  "args": ["$script_dir/server_gpt5.py"],
+  "cwd": "$script_dir",
+  "env": {
+    "PYTHONPATH": "$script_dir"
+  }
+}
+EOF
     fi
 }
 
