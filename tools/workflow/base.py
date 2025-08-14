@@ -21,6 +21,22 @@ from tools.shared.base_tool import BaseTool
 from .schema_builders import WorkflowSchemaBuilder
 from .workflow_mixin import BaseWorkflowMixin
 
+# Import GPT-5/Opus 4.1 optimizations
+try:
+    from utils.model_capabilities import (
+        get_model_capabilities,
+        get_optimal_models_for_task,
+        supports_reasoning,
+        get_max_reasoning_tokens
+    )
+    from utils.token_budgeter import TokenBudgeter, ContextPart, ContextPriority
+    from utils.reasoning_policy import ReasoningPolicy, TaskKind, get_task_kind_from_tool
+    from utils.handoff import HandoffManager, HandoffEnvelope
+    from utils.file_selector import FileSelector, FileSelectionResult
+    MODEL_OPTIMIZATIONS_AVAILABLE = True
+except ImportError:
+    MODEL_OPTIMIZATIONS_AVAILABLE = False
+
 
 class WorkflowTool(BaseTool, BaseWorkflowMixin):
     """
@@ -68,6 +84,18 @@ class WorkflowTool(BaseTool, BaseWorkflowMixin):
         """Initialize WorkflowTool with proper multiple inheritance."""
         BaseTool.__init__(self)
         BaseWorkflowMixin.__init__(self)
+        
+        # Initialize GPT-5/Opus 4.1 optimization components if available
+        if MODEL_OPTIMIZATIONS_AVAILABLE:
+            self.token_budgeter = TokenBudgeter()
+            self.reasoning_policy = ReasoningPolicy()
+            self.handoff_manager = HandoffManager()
+            self.file_selector = FileSelector()
+        else:
+            self.token_budgeter = None
+            self.reasoning_policy = None
+            self.handoff_manager = None
+            self.file_selector = None
 
     def get_tool_fields(self) -> dict[str, dict[str, Any]]:
         """
@@ -425,6 +453,273 @@ class WorkflowTool(BaseTool, BaseWorkflowMixin):
         """Prepare context for external model call"""
         pass
 
+    # Model-aware optimization methods
+    
+    def get_optimal_model_for_workflow(self, task_type: Optional[str] = None) -> Optional[str]:
+        """
+        Get the optimal model for this workflow based on task type.
+        
+        Args:
+            task_type: Optional task type override (defaults to tool name)
+            
+        Returns:
+            Optimal model name or None if optimizations unavailable
+        """
+        if not MODEL_OPTIMIZATIONS_AVAILABLE:
+            return None
+        
+        # Determine task type from tool name if not provided
+        if not task_type:
+            tool_name = self.get_name()
+            task_type = tool_name.replace("_", "").lower()
+        
+        # Get optimal models for task
+        models = get_optimal_models_for_task(task_type)
+        return models[0] if models else None
+    
+    def prepare_model_aware_context(
+        self,
+        model: str,
+        request: Any,
+        consolidated_findings: Any,
+        include_files: bool = True
+    ) -> tuple[str, dict[str, Any]]:
+        """
+        Prepare context optimized for the specific model's capabilities.
+        
+        Args:
+            model: Model identifier
+            request: Workflow request
+            consolidated_findings: Accumulated findings
+            include_files: Whether to include file content
+            
+        Returns:
+            Tuple of (context_text, metadata)
+        """
+        if not MODEL_OPTIMIZATIONS_AVAILABLE or not self.token_budgeter:
+            # Fallback to standard context preparation
+            context = self.prepare_expert_analysis_context(consolidated_findings)
+            return context, {}
+        
+        # Get model capabilities
+        caps = get_model_capabilities(model)
+        if not caps:
+            context = self.prepare_expert_analysis_context(consolidated_findings)
+            return context, {}
+        
+        # Build context parts with priorities
+        parts = []
+        
+        # System context (highest priority)
+        parts.append(ContextPart(
+            "system",
+            ContextPriority.REQUIRED,
+            self.get_system_prompt(),
+            hard_required=True
+        ))
+        
+        # Task description
+        initial_desc = getattr(request, 'step', '')
+        if initial_desc:
+            parts.append(ContextPart(
+                "task",
+                95,
+                f"Task: {initial_desc}",
+                hard_required=True
+            ))
+        
+        # Findings (high priority)
+        if consolidated_findings.findings:
+            findings_text = "\n".join(consolidated_findings.findings)
+            parts.append(ContextPart(
+                "findings",
+                85,
+                f"Findings:\n{findings_text}",
+                hard_required=False
+            ))
+        
+        # Files (medium priority, model-dependent)
+        if include_files and consolidated_findings.relevant_files:
+            # Use file selector for smart file loading
+            if self.file_selector and model:
+                file_result = self.file_selector.select_files(
+                    list(consolidated_findings.relevant_files),
+                    model,
+                    task_context=initial_desc,
+                    strategy="auto"  # Auto-select based on model
+                )
+                
+                # Build file content from selected files
+                file_content = []
+                for file_info in file_result.selected_files:
+                    status = " (summarized)" if file_info.is_summarized else ""
+                    file_content.append(f"\n--- {file_info.path}{status} ---\n{file_info.content}")
+                
+                if file_content:
+                    parts.append(ContextPart(
+                        "files",
+                        70,
+                        "\n".join(file_content),
+                        hard_required=False
+                    ))
+                
+                metadata = {
+                    "files_included": len(file_result.selected_files),
+                    "files_total": file_result.total_files,
+                    "files_summarized": file_result.files_summarized,
+                    "tokens_used": file_result.total_tokens
+                }
+            else:
+                # Fallback to simple file listing
+                file_list = "\n".join(f"- {f}" for f in consolidated_findings.relevant_files)
+                parts.append(ContextPart(
+                    "files",
+                    70,
+                    f"Relevant files:\n{file_list}",
+                    hard_required=False
+                ))
+                metadata = {"files_included": len(consolidated_findings.relevant_files)}
+        else:
+            metadata = {}
+        
+        # Build optimized context
+        result = self.token_budgeter.build_context(model, parts)
+        
+        # Add metadata
+        metadata.update({
+            "model": model,
+            "tokens_used": result.tokens_used,
+            "tokens_available": result.tokens_available,
+            "parts_included": result.parts_included,
+            "parts_omitted": result.parts_omitted,
+            "had_to_summarize": result.had_to_summarize
+        })
+        
+        return result.final_text, metadata
+    
+    def get_reasoning_params_for_step(
+        self,
+        model: str,
+        step_number: int,
+        confidence: str,
+        attempt: int = 1
+    ) -> Optional[dict[str, Any]]:
+        """
+        Get reasoning parameters for the current workflow step.
+        
+        Args:
+            model: Model identifier
+            step_number: Current step number
+            confidence: Current confidence level
+            attempt: Attempt number (for escalation)
+            
+        Returns:
+            Reasoning parameters or None if not applicable
+        """
+        if not MODEL_OPTIMIZATIONS_AVAILABLE or not self.reasoning_policy:
+            return None
+        
+        # Check if model supports reasoning
+        if not supports_reasoning(model):
+            return None
+        
+        # Get task kind from tool name
+        task_kind = get_task_kind_from_tool(self.get_name())
+        
+        # Get adaptive parameters based on step and confidence
+        params = self.reasoning_policy.get_adaptive_params(
+            model, task_kind, attempt
+        )
+        
+        # Adjust based on confidence
+        if params and confidence in ["exploring", "low"]:
+            # Increase reasoning for low confidence
+            current_tokens = params.get("reasoning_tokens", 0)
+            params["reasoning_tokens"] = min(
+                int(current_tokens * 1.5),
+                get_max_reasoning_tokens(model) or current_tokens
+            )
+        
+        return params
+    
+    def should_handoff_to_model(self, current_model: str, step_number: int) -> Optional[str]:
+        """
+        Determine if workflow should handoff to a different model.
+        
+        Args:
+            current_model: Currently active model
+            step_number: Current step number
+            
+        Returns:
+            Target model for handoff or None to continue with current
+        """
+        if not MODEL_OPTIMIZATIONS_AVAILABLE:
+            return None
+        
+        # Get model capabilities
+        caps = get_model_capabilities(current_model)
+        if not caps:
+            return None
+        
+        # Consider handoff scenarios
+        tool_name = self.get_name()
+        
+        # GPT-5 -> GPT-4.1 for large file analysis
+        if current_model == "gpt-5" and tool_name in ["analyze", "refactor"]:
+            if step_number > 2:  # After initial investigation
+                # Check if we have many files to analyze
+                if hasattr(self, 'consolidated_findings'):
+                    file_count = len(self.consolidated_findings.files_checked)
+                    if file_count > 20:  # Threshold for switching
+                        return "gpt-4.1"  # Better for large contexts
+        
+        # GPT-4.1 -> GPT-5 for complex reasoning
+        if current_model == "gpt-4.1" and tool_name in ["debug", "secaudit"]:
+            if step_number > 3:  # After gathering context
+                return "gpt-5"  # Better for reasoning
+        
+        return None
+    
+    def create_handoff_envelope(
+        self,
+        source_model: str,
+        target_model: str,
+        request: Any,
+        consolidated_findings: Any
+    ) -> Optional[HandoffEnvelope]:
+        """
+        Create a handoff envelope for model transition.
+        
+        Args:
+            source_model: Current model
+            target_model: Target model
+            request: Workflow request
+            consolidated_findings: Current findings
+            
+        Returns:
+            HandoffEnvelope or None if not available
+        """
+        if not MODEL_OPTIMIZATIONS_AVAILABLE or not self.handoff_manager:
+            return None
+        
+        # Get task info
+        task_kind = get_task_kind_from_tool(self.get_name())
+        stage_id = f"{self.get_name()}_step_{getattr(request, 'step_number', 1)}"
+        
+        # Create handoff
+        envelope = self.handoff_manager.create_handoff(
+            source_model=source_model,
+            target_model=target_model,
+            stage_id=stage_id,
+            task_kind=task_kind,
+            task_summary=getattr(request, 'step', 'Workflow task'),
+            findings=consolidated_findings.findings[-5:],  # Last 5 findings
+            file_refs=[],  # Could enhance with file references
+            next_instructions=f"Continue {self.get_name()} workflow analysis"
+        )
+        
+        return envelope
+    
     # Default execute method - delegates to workflow
     async def execute(self, arguments: dict[str, Any]) -> list:
         """Execute the workflow tool - delegates to BaseWorkflowMixin."""

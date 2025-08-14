@@ -143,6 +143,15 @@ except ValueError:
 
 CONVERSATION_TIMEOUT_SECONDS = CONVERSATION_TIMEOUT_HOURS * 3600
 
+# Import model capabilities for model-aware context
+try:
+    from .model_capabilities import get_model_capabilities, CAPABILITIES
+    from .token_budgeter import TokenBudgeter, ContextPart, ContextPriority
+    MODEL_AWARE_FEATURES = True
+except ImportError:
+    logger.info("Model-aware features not available, using legacy behavior")
+    MODEL_AWARE_FEATURES = False
+
 
 class ConversationTurn(BaseModel):
     """
@@ -1093,3 +1102,274 @@ def _is_valid_uuid(val: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+# ============================================================================
+# MODEL-AWARE CONTEXT METHODS (GPT-5 & Opus 4.1 Optimizations)
+# ============================================================================
+
+def get_context_for_model(model: str, context: ThreadContext, 
+                         include_files: bool = True,
+                         include_images: bool = True) -> str:
+    """
+    Get optimized conversation context based on model capabilities.
+    
+    This method provides model-aware context retrieval:
+    - GPT-4.1 (1M context): Full conversation history with all files
+    - GPT-5 (400K context): Recent turns with smart summarization
+    - Other models: Aggressive summarization to fit limits
+    
+    Args:
+        model: Model identifier (e.g., "gpt-5", "gpt-4.1")
+        context: Thread context with conversation history
+        include_files: Whether to include file contents
+        include_images: Whether to include image references
+        
+    Returns:
+        Formatted conversation context optimized for the model
+    """
+    if not MODEL_AWARE_FEATURES:
+        # Fallback to standard behavior
+        history, _ = build_conversation_history(context)
+        return history
+    
+    caps = get_model_capabilities(model)
+    if not caps:
+        # Unknown model - use conservative approach
+        return get_summarized_context(context, max_turns=5)
+    
+    # Model-specific strategies
+    if caps.max_input_tokens >= 900_000:
+        # Large context models (GPT-4.1) - include everything
+        return get_full_context(context, include_files, include_images)
+    
+    elif caps.max_input_tokens >= 400_000:
+        # Medium context models (GPT-5) - smart balance
+        return get_balanced_context(context, model, include_files, include_images)
+    
+    else:
+        # Small context models - aggressive summarization
+        return get_summarized_context(context, max_turns=3)
+
+
+def get_full_context(context: ThreadContext, 
+                     include_files: bool = True,
+                     include_images: bool = True) -> str:
+    """
+    Get complete conversation history for large context models.
+    
+    Used for models like GPT-4.1 with 1M+ context windows.
+    
+    Args:
+        context: Thread context
+        include_files: Whether to include file contents
+        include_images: Whether to include images
+        
+    Returns:
+        Complete formatted conversation history
+    """
+    history, tokens = build_conversation_history(context)
+    
+    logger.info(f"Providing full context for large model: {tokens:,} tokens, "
+               f"{len(context.turns)} turns")
+    
+    return history
+
+
+def get_balanced_context(context: ThreadContext, model: str,
+                         include_files: bool = True,
+                         include_images: bool = True) -> str:
+    """
+    Get balanced context with smart summarization for medium models.
+    
+    Used for models like GPT-5 with 400K context windows.
+    Preserves recent turns in full, summarizes older content.
+    
+    Args:
+        context: Thread context  
+        model: Model identifier
+        include_files: Whether to include files
+        include_images: Whether to include images
+        
+    Returns:
+        Balanced conversation context
+    """
+    if not MODEL_AWARE_FEATURES:
+        history, _ = build_conversation_history(context)
+        return history
+    
+    # Use token budgeter for smart allocation
+    budgeter = TokenBudgeter()
+    
+    # Create context parts with priorities
+    parts = []
+    
+    # Recent turns get high priority (keep last 10 turns)
+    recent_turns = context.turns[-10:] if len(context.turns) > 10 else context.turns
+    for i, turn in enumerate(recent_turns):
+        priority = ContextPriority.HIGH.value if i >= len(recent_turns) - 5 else ContextPriority.MEDIUM.value
+        parts.append(ContextPart(
+            id=f"turn_{turn.timestamp}",
+            priority=priority,
+            content=_format_turn(turn),
+            hard_required=False
+        ))
+    
+    # Older turns get lower priority (summarize if needed)
+    if len(context.turns) > 10:
+        older_turns = context.turns[:-10]
+        summary = _summarize_turns(older_turns)
+        parts.append(ContextPart(
+            id="older_turns_summary",
+            priority=ContextPriority.LOW.value,
+            content=summary,
+            hard_required=False
+        ))
+    
+    # Files from recent turns
+    if include_files:
+        files = get_conversation_file_list(context)
+        for i, file_path in enumerate(files[:10]):  # Limit to 10 most recent files
+            priority = ContextPriority.HIGH.value if i < 3 else ContextPriority.MEDIUM.value
+            try:
+                content = _read_file_for_context(file_path)
+                if content:
+                    parts.append(ContextPart(
+                        id=f"file_{file_path}",
+                        priority=priority,
+                        content=content,
+                        hard_required=False
+                    ))
+            except Exception as e:
+                logger.debug(f"Could not include file {file_path}: {e}")
+    
+    # Build optimized context
+    result = budgeter.build_context(model, parts)
+    
+    logger.info(f"Balanced context for {model}: {result.tokens_used:,} tokens, "
+               f"{len(result.parts_included)} parts included, "
+               f"{len(result.parts_dropped)} dropped")
+    
+    return result.final_text
+
+
+def get_summarized_context(context: ThreadContext, max_turns: int = 5) -> str:
+    """
+    Get aggressively summarized context for small models.
+    
+    Args:
+        context: Thread context
+        max_turns: Maximum number of recent turns to include
+        
+    Returns:
+        Summarized conversation context
+    """
+    parts = []
+    
+    # Summary of older conversation
+    if len(context.turns) > max_turns:
+        older_turns = context.turns[:-max_turns]
+        summary = _summarize_turns(older_turns)
+        parts.append("## Previous Conversation Summary\n")
+        parts.append(summary)
+        parts.append("\n")
+    
+    # Recent turns in full
+    parts.append("## Recent Conversation\n")
+    recent_turns = context.turns[-max_turns:] if len(context.turns) > max_turns else context.turns
+    
+    for turn in recent_turns:
+        parts.append(_format_turn(turn))
+        parts.append("\n")
+    
+    # Brief file list (no contents)
+    files = get_conversation_file_list(context)
+    if files:
+        parts.append("\n## Referenced Files\n")
+        for file_path in files[:10]:
+            parts.append(f"- {file_path}\n")
+    
+    return "".join(parts)
+
+
+def _format_turn(turn: ConversationTurn) -> str:
+    """Format a single conversation turn."""
+    header = f"--- Turn {turn.role} ({turn.tool_name or 'unknown'}) at {turn.timestamp} ---\n"
+    content = turn.content
+    
+    if turn.files:
+        files_note = f"[Files: {', '.join(turn.files)}]\n"
+        return header + files_note + content
+    
+    return header + content
+
+
+def _summarize_turns(turns: list[ConversationTurn]) -> str:
+    """
+    Create a summary of conversation turns.
+    
+    Args:
+        turns: List of turns to summarize
+        
+    Returns:
+        Summary string
+    """
+    if not turns:
+        return "No previous conversation."
+    
+    summary_parts = []
+    summary_parts.append(f"Previous {len(turns)} turns covered:")
+    
+    # Group by tool
+    by_tool = {}
+    for turn in turns:
+        tool = turn.tool_name or "unknown"
+        if tool not in by_tool:
+            by_tool[tool] = []
+        by_tool[tool].append(turn)
+    
+    # Summarize by tool
+    for tool, tool_turns in by_tool.items():
+        summary_parts.append(f"- {tool}: {len(tool_turns)} exchanges")
+    
+    # Extract key topics (simplified - in production would use NLP)
+    files_mentioned = set()
+    for turn in turns:
+        if turn.files:
+            files_mentioned.update(turn.files)
+    
+    if files_mentioned:
+        summary_parts.append(f"- Files discussed: {', '.join(list(files_mentioned)[:5])}")
+        if len(files_mentioned) > 5:
+            summary_parts.append(f"  ... and {len(files_mentioned) - 5} more files")
+    
+    return "\n".join(summary_parts)
+
+
+def _read_file_for_context(file_path: str, max_size: int = 50000) -> Optional[str]:
+    """
+    Read file content for context inclusion.
+    
+    Args:
+        file_path: Path to file
+        max_size: Maximum file size in bytes
+        
+    Returns:
+        File content or None if too large/missing
+    """
+    try:
+        if not os.path.exists(file_path):
+            return None
+        
+        size = os.path.getsize(file_path)
+        if size > max_size:
+            return f"[File {file_path} truncated - {size:,} bytes]"
+        
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        
+        return f"### File: {file_path}\n```\n{content}\n```\n"
+    
+    except Exception as e:
+        logger.debug(f"Could not read file {file_path}: {e}")
+        return None

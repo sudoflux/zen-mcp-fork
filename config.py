@@ -71,6 +71,53 @@ DEFAULT_CONSENSUS_MAX_INSTANCES_PER_COMBINATION = 2
 # NOTE: Consensus tool now uses sequential processing for MCP compatibility
 # Concurrent processing was removed to avoid async pattern violations
 
+# Model Preferences for GPT-5 & Opus 4.1 Optimizations
+# These preferences guide automatic model selection based on task type
+MODEL_PREFERENCES = {
+    "planning": ["gpt-4.1", "gpt-5"],  # GPT-4.1 for large context, GPT-5 for reasoning
+    "code_review": ["gpt-5", "gpt-4.1"],  # GPT-5 for deep analysis, GPT-4.1 for coverage
+    "debugging": ["gpt-5", "o3"],  # GPT-5 for reasoning, O3 as fallback
+    "refactoring": ["gpt-4.1", "gpt-5"],  # GPT-4.1 for entire codebase understanding
+    "architecture": ["gpt-5", "gpt-4.1"],  # Both excellent for architecture
+    "security_audit": ["gpt-5", "o3"],  # GPT-5 for comprehensive analysis
+    "testing": ["gpt-5", "gpt-5-mini"],  # GPT-5 for test generation
+    "documentation": ["gpt-5-mini", "gpt-5"],  # Mini for speed, full for quality
+    "chat": ["gpt-5-mini", "gpt-5-nano", "gpt-5"],  # Fast models for chat
+    "general": ["gpt-5", "gpt-4.1", "o3"],  # General fallback order
+}
+
+# GPT-5 Specific Configuration
+GPT5_CONFIG = {
+    "default_thinking_mode": os.getenv("GPT5_DEFAULT_THINKING_MODE", "medium"),
+    "max_reasoning_tokens": int(os.getenv("GPT5_MAX_REASONING_TOKENS", "12000")),
+    "escalation_enabled": os.getenv("GPT5_ESCALATION_ENABLED", "true").lower() == "true",
+    "file_strategy": os.getenv("GPT5_FILE_STRATEGY", "priority"),  # all, priority, summary
+    "conversation_strategy": os.getenv("GPT5_CONVERSATION_STRATEGY", "balanced"),  # full, balanced, summary
+}
+
+# GPT-4.1 (Opus) Specific Configuration  
+GPT4_1_CONFIG = {
+    "auto_continue": os.getenv("GPT4_1_AUTO_CONTINUE", "true").lower() == "true",
+    "max_output_tokens": int(os.getenv("GPT4_1_MAX_OUTPUT", "32000")),
+    "file_strategy": os.getenv("GPT4_1_FILE_STRATEGY", "all"),  # all, priority, summary
+    "conversation_strategy": os.getenv("GPT4_1_CONVERSATION_STRATEGY", "full"),  # full, balanced, summary
+}
+
+# Token Budget Allocation (as percentages of available tokens)
+TOKEN_BUDGET_CONFIG = {
+    "system": float(os.getenv("TOKEN_BUDGET_SYSTEM", "0.02")),  # 2% for system prompts
+    "instructions": float(os.getenv("TOKEN_BUDGET_INSTRUCTIONS", "0.03")),  # 3% for instructions
+    "files": float(os.getenv("TOKEN_BUDGET_FILES", "0.60")),  # 60% for file content
+    "conversation": float(os.getenv("TOKEN_BUDGET_CONVERSATION", "0.27")),  # 27% for history
+    "buffer": float(os.getenv("TOKEN_BUDGET_BUFFER", "0.08")),  # 8% safety margin
+}
+
+# Validate budget allocations
+_budget_total = sum(TOKEN_BUDGET_CONFIG.values())
+if _budget_total > 1.0:
+    import warnings
+    warnings.warn(f"Token budget allocations sum to {_budget_total:.2f}, should be <= 1.0")
+
 # MCP Protocol Transport Limits
 #
 # IMPORTANT: This limit ONLY applies to the Claude CLI ↔ MCP Server transport boundary.
