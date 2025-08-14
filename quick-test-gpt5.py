@@ -19,7 +19,7 @@ if api_key:
         response = client.chat.completions.create(
             model='gpt-5',
             messages=[{'role': 'user', 'content': 'Say "GPT-5 working!"'}],
-            max_tokens=10
+            max_completion_tokens=10
         )
         print(f"✅ Success: {response.choices[0].message.content}")
         
