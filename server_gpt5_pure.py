@@ -68,7 +68,7 @@ def setup_gpt5_provider():
             response = client.chat.completions.create(
                 model="gpt-5",
                 messages=[{"role": "user", "content": "Hello"}],
-                max_tokens=5
+                max_completion_tokens=5
             )
             logger.info("✓ GPT-5 provider verified and ready")
             logger.info(f"✓ GPT-5 context: {GPT5_CONFIG['context_window']:,} tokens")

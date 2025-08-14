@@ -133,7 +133,7 @@ print('GPT-5 Response:', response.choices[0].message.content)
   "mcpServers": {
     "gpt5": {
       "command": "$script_dir/.zen_venv/bin/python",
-      "args": ["$script_dir/server_gpt5.py"],
+      "args": ["$script_dir/server_gpt5_pure.py"],
       "cwd": "$script_dir",
       "env": {
         "PYTHONPATH": "$script_dir"
