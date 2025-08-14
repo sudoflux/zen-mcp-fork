@@ -100,12 +100,19 @@ load_dotenv()
 
 import openai
 client = openai.OpenAI()
+
+# Get available models and use the first GPT model
+models = client.models.list()
+model_ids = [m.id for m in models.data]
+gpt_models = [m for m in model_ids if 'gpt' in m.lower()]
+available_model = gpt_models[0] if gpt_models else model_ids[0]
+
 response = client.chat.completions.create(
-    model='gpt-4',
+    model=available_model,
     messages=[{'role': 'user', 'content': 'test'}],
     max_tokens=5
 )
-print('✓ OpenAI API working')
+print(f'✓ OpenAI API working with {available_model}')
 " 2>/dev/null; then
         print_success "OpenAI API connection working"
     else

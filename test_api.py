@@ -33,10 +33,11 @@ try:
     gpt_models = [m for m in model_ids if 'gpt' in m.lower()]
     print(f'📋 Available GPT models: {gpt_models[:5]}')
     
-    # Test 2: Simple completion with cheapest model
-    print('\n🧪 Testing API call with gpt-3.5-turbo...')
+    # Test 2: Simple completion with available model
+    available_model = gpt_models[0] if gpt_models else model_ids[0]
+    print(f'\n🧪 Testing API call with {available_model}...')
     response = client.chat.completions.create(
-        model='gpt-3.5-turbo',
+        model=available_model,
         messages=[{'role': 'user', 'content': 'Say "test"'}],
         max_tokens=5
     )
