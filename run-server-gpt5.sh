@@ -65,7 +65,8 @@ clear_python_cache() {
 # ----------------------------------------------------------------------------
 
 find_python() {
-    local required_version="3.9"
+    local required_major="3"
+    local required_minor="9"
     local python_cmd=""
     
     # Try various Python commands
@@ -73,7 +74,11 @@ find_python() {
         if command -v "$cmd" &> /dev/null; then
             local version
             version=$("$cmd" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-            if [[ $(echo "$version >= $required_version" | bc -l) -eq 1 ]]; then
+            local major="${version%.*}"
+            local minor="${version#*.}"
+            
+            # Check if version meets requirements (3.9+)
+            if [[ "$major" -eq "$required_major" ]] && [[ "$minor" -ge "$required_minor" ]]; then
                 python_cmd="$cmd"
                 break
             fi
