@@ -26,13 +26,15 @@ from config_gpt5 import __author__, __updated__, __version__, GPT5_CONFIG
 from providers.base import ProviderType
 from providers.openai_provider import OpenAIModelProvider
 from providers.registry import ModelProviderRegistry
-from utils.file_utils import setup_logging
-
 # Load environment variables
 load_dotenv()
 
 # Setup logging
-logger = setup_logging(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # Create MCP server instance
 mcp_server = Server("gpt5-claude")
