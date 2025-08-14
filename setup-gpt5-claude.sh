@@ -76,10 +76,16 @@ EOF
     print_info "Testing GPT-5 connection..."
     if python3 -c "
 import os
+import sys
+sys.path.insert(0, '$script_dir')
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv('$script_dir/.env')
 import openai
-client = openai.OpenAI()
+api_key = os.getenv('OPENAI_API_KEY')
+if not api_key:
+    print('No API key found')
+    exit(1)
+client = openai.OpenAI(api_key=api_key)
 response = client.chat.completions.create(
     model='gpt-5',
     messages=[{'role': 'user', 'content': 'Hello GPT-5'}],
